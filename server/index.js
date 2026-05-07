@@ -9,7 +9,7 @@ import path from 'node:path';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import helmet from 'helmet';
-import { MercadoPagoConfig, Preference } from 'mercadopago';
+import { MercadoPagoConfig, Payment, PaymentRefund, Preference } from 'mercadopago';
 import { z } from 'zod';
 import { db, initDb, mapPayment, mapReservation, readConfig } from './db.js';
 import { appUrl, sendEmail } from './mailer.js';
@@ -25,7 +25,7 @@ const allowedOrigins = [
   process.env.FRONTEND_URL,
   process.env.APP_URL,
 ].filter(Boolean);
-const mercadoPagoToken = process.env.MERCADO_PAGO_ACCESS_TOKEN || '';
+const mercadoPagoToken = process.env.MERCADOPAGO_ACCESS_TOKEN || process.env.MERCADO_PAGO_ACCESS_TOKEN || '';
 const mpClient = mercadoPagoToken ? new MercadoPagoConfig({ accessToken: mercadoPagoToken }) : null;
 
 initDb();
@@ -100,6 +100,25 @@ const createPayment = async ({ reservationId = null, orderId = null, method, amo
   db.prepare(`INSERT INTO payments (id, reservation_id, order_id, method, amount, status, provider, provider_reference, checkout_url, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, reservationId, orderId, method, amount, status, 'mercado_pago_sandbox', providerReference, checkoutUrl, now(), now());
   return mapPayment(db.prepare('SELECT * FROM payments WHERE id = ?').get(id));
+};
+
+const mapMercadoPagoStatus = (status) => {
+  if (status === 'approved') return 'paid';
+  if (status === 'rejected') return 'failed';
+  if (status === 'cancelled') return 'cancelled';
+  if (status === 'refunded') return 'refunded';
+  if (status === 'charged_back') return 'failed';
+  return 'pending';
+};
+
+const applyPaymentStatus = ({ payment, status, externalPaymentId = null, gatewayPayload = null, performedBy = 'mercado_pago' }) => {
+  if (!payment || payment.status === status) return false;
+  db.prepare('UPDATE payments SET status = ?, external_payment_id = COALESCE(?, external_payment_id), gateway_payload = COALESCE(?, gateway_payload), updated_at = ? WHERE id = ?')
+    .run(status, externalPaymentId, gatewayPayload ? JSON.stringify(gatewayPayload).slice(0, 6000) : null, now(), payment.id);
+  if (payment.reservation_id) db.prepare('UPDATE reservations SET payment_status = ?, status = CASE WHEN ? = "paid" THEN "confirmed" ELSE status END, updated_at = ? WHERE id = ?').run(status, status, now(), payment.reservation_id);
+  if (payment.order_id) db.prepare('UPDATE orders SET payment_status = ?, updated_at = ? WHERE id = ?').run(status, now(), payment.order_id);
+  audit('payment', payment.id, 'status_pagamento_atualizado', performedBy, payment.status, status);
+  return true;
 };
 
 const requireAuth = (req, res, next) => {
@@ -206,7 +225,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
 });
 app.post('/api/auth/logout', (_req, res) => res.clearCookie('session', authCookieOptions).json({ ok: true }));
 app.get('/api/auth/me', requireAuth, (req, res) => res.json({ user: sanitizeUser(req.user) }));
-app.post('/api/auth/forgot-password', async (req, res) => {
+app.post('/api/auth/forgot-password', loginLimiter, async (req, res) => {
   const parsed = z.object({ email: emailSchema }).safeParse(req.body);
   if (parsed.success) {
     const user = db.prepare('SELECT * FROM users WHERE email = ?').get(parsed.data.email);
@@ -222,7 +241,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   }
   res.json({ message: 'Se o email existir, enviaremos instrucoes de recuperacao.' });
 });
-app.post('/api/auth/reset-password', async (req, res) => {
+app.post('/api/auth/reset-password', loginLimiter, async (req, res) => {
   const parsed = z.object({ token: z.string().min(20), password: z.string().min(8).max(128) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ message: 'Dados invalidos.' });
   const row = db.prepare('SELECT * FROM password_reset_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?').get(tokenHash(parsed.data.token), now());
@@ -296,7 +315,7 @@ app.post('/api/admin/payments/:id/sandbox-paid', requireAuth, requireRole('admin
   res.json({ payment: db.prepare('SELECT * FROM payments WHERE id = ?').get(payment.id) });
 });
 
-app.post('/api/admin/payments/:id/refund', requireAuth, requireRole('admin'), (req, res) => {
+app.post('/api/admin/payments/:id/refund', requireAuth, requireRole('admin'), async (req, res) => {
   const parsed = z.object({ reason: z.string().trim().min(3).max(240), amount: z.number().positive().optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ message: 'Dados invalidos.' });
   const payment = db.prepare('SELECT * FROM payments WHERE id = ?').get(req.params.id);
@@ -305,8 +324,20 @@ app.post('/api/admin/payments/:id/refund', requireAuth, requireRole('admin'), (r
   const amount = Math.min(parsed.data.amount ?? payment.amount, payment.amount);
   const refundStatus = amount >= payment.amount ? 'refunded' : 'partially_refunded';
   const refundId = randomUUID();
-  db.prepare('INSERT INTO refunds (id, payment_id, reservation_id, amount, reason, status, requested_by, created_at, processed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(refundId, payment.id, payment.reservation_id, amount, parsed.data.reason, 'processed', req.user.id, now(), now());
+  let providerRefundId = null;
+  let localRefundStatus = 'processed';
+  if (mpClient && payment.external_payment_id) {
+    try {
+      const refundClient = new PaymentRefund(mpClient);
+      const response = await refundClient.create({ payment_id: payment.external_payment_id, body: amount < payment.amount ? { amount } : {} });
+      providerRefundId = String(response.id || '');
+      localRefundStatus = response.status === 'approved' || response.status === 'processed' ? 'processed' : 'requested';
+    } catch (error) {
+      return res.status(502).json({ message: `Mercado Pago recusou o estorno: ${error.message || 'erro desconhecido'}` });
+    }
+  }
+  db.prepare('INSERT INTO refunds (id, payment_id, reservation_id, amount, reason, status, provider_refund_id, requested_by, created_at, processed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(refundId, payment.id, payment.reservation_id, amount, parsed.data.reason, localRefundStatus, providerRefundId, req.user.id, now(), localRefundStatus === 'processed' ? now() : null);
   db.prepare('UPDATE payments SET status = ?, updated_at = ? WHERE id = ?').run(refundStatus, now(), payment.id);
   if (payment.reservation_id) db.prepare('UPDATE reservations SET payment_status = ?, updated_at = ? WHERE id = ?').run(refundStatus, now(), payment.reservation_id);
   if (payment.order_id) db.prepare('UPDATE orders SET payment_status = ?, updated_at = ? WHERE id = ?').run(refundStatus, now(), payment.order_id);
@@ -314,17 +345,63 @@ app.post('/api/admin/payments/:id/refund', requireAuth, requireRole('admin'), (r
   res.json({ refund: db.prepare('SELECT * FROM refunds WHERE id = ?').get(refundId), payment: db.prepare('SELECT * FROM payments WHERE id = ?').get(payment.id) });
 });
 
-app.post('/api/payments/webhook/mercado-pago', (req, res) => {
-  const externalReference = req.body?.data?.id || req.body?.external_reference || req.body?.id;
-  const status = req.body?.status === 'approved' || req.body?.action === 'payment.updated' ? 'paid' : 'pending';
-  const payment = db.prepare('SELECT * FROM payments WHERE provider_reference = ? OR id = ?').get(externalReference, externalReference);
-  if (payment && payment.status !== status) {
-    db.prepare('UPDATE payments SET status = ?, updated_at = ? WHERE id = ?').run(status, now(), payment.id);
-    if (payment.reservation_id) db.prepare('UPDATE reservations SET payment_status = ?, status = CASE WHEN ? = "paid" THEN "confirmed" ELSE status END, updated_at = ? WHERE id = ?').run(status, status, now(), payment.reservation_id);
-    if (payment.order_id) db.prepare('UPDATE orders SET payment_status = ?, updated_at = ? WHERE id = ?').run(status, now(), payment.order_id);
-    audit('payment', payment.id, 'webhook_mercado_pago', 'mercado_pago', payment.status, status);
+app.post('/api/me/reservations/:id/payment', requireAuth, requireRole('client'), requireVerified, async (req, res) => {
+  const parsed = z.object({ method: z.enum(['credit_card', 'debit_card', 'pix']) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ message: 'Dados invalidos.' });
+  const reservation = db.prepare('SELECT * FROM reservations WHERE id = ? AND user_id = ?').get(req.params.id, req.user.id);
+  if (!reservation) return res.status(404).json({ message: 'Reserva nao encontrada.' });
+  if (!['unpaid', 'failed', 'cancelled'].includes(reservation.payment_status)) return res.status(409).json({ message: 'Pagamento ja iniciado ou concluido.' });
+  const payment = await createPayment({ reservationId: reservation.id, method: parsed.data.method, amount: 0.5, description: 'Taxa de reserva' });
+  db.prepare('UPDATE reservations SET payment_id = ?, payment_method = ?, payment_status = ?, amount = ?, updated_at = ? WHERE id = ?')
+    .run(payment.id, parsed.data.method, payment.status, 0.5, now(), reservation.id);
+  audit('payment', payment.id, 'pagamento_reserva_iniciado', req.user.id);
+  res.status(201).json({ payment });
+});
+
+app.post('/api/me/orders/:id/payment', requireAuth, requireRole('client'), requireVerified, async (req, res) => {
+  const parsed = z.object({ method: z.enum(['credit_card', 'debit_card', 'pix']) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ message: 'Dados invalidos.' });
+  const order = db.prepare('SELECT * FROM orders WHERE id = ? AND user_id = ?').get(req.params.id, req.user.id);
+  if (!order) return res.status(404).json({ message: 'Pedido nao encontrado.' });
+  if (!['unpaid', 'failed', 'cancelled'].includes(order.payment_status)) return res.status(409).json({ message: 'Pagamento ja iniciado ou concluido.' });
+  const payment = await createPayment({ orderId: order.id, method: parsed.data.method, amount: order.total, description: 'Pedido online' });
+  db.prepare('UPDATE orders SET payment_id = ?, payment_method = ?, payment_status = ?, updated_at = ? WHERE id = ?')
+    .run(payment.id, parsed.data.method, payment.status, now(), order.id);
+  audit('payment', payment.id, 'pagamento_pedido_iniciado', req.user.id);
+  res.status(201).json({ payment });
+});
+
+app.post('/api/payments/webhook/mercado-pago', async (req, res) => {
+  const paymentId = String(req.body?.data?.id || req.query?.['data.id'] || req.query?.id || req.body?.id || '');
+  if (!paymentId) return res.json({ received: true });
+  if (!mpClient) return res.status(503).json({ message: 'Mercado Pago nao configurado.' });
+  try {
+    const paymentClient = new Payment(mpClient);
+    const mpPayment = await paymentClient.get({ id: paymentId });
+    const internalId = mpPayment.external_reference;
+    const payment = db.prepare('SELECT * FROM payments WHERE id = ? OR external_payment_id = ?').get(internalId, String(mpPayment.id));
+    if (payment) {
+      applyPaymentStatus({
+        payment,
+        status: mapMercadoPagoStatus(mpPayment.status),
+        externalPaymentId: String(mpPayment.id),
+        gatewayPayload: {
+          id: mpPayment.id,
+          status: mpPayment.status,
+          status_detail: mpPayment.status_detail,
+          payment_method_id: mpPayment.payment_method_id,
+          payment_type_id: mpPayment.payment_type_id,
+          transaction_amount: mpPayment.transaction_amount,
+          external_reference: mpPayment.external_reference,
+          date_approved: mpPayment.date_approved,
+        },
+        performedBy: 'mercado_pago_webhook',
+      });
+    }
+    res.json({ received: true });
+  } catch (error) {
+    res.status(502).json({ message: `Nao foi possivel validar pagamento no Mercado Pago: ${error.message || 'erro desconhecido'}` });
   }
-  res.json({ received: true });
 });
 
 app.get('/api/me/orders', requireAuth, requireRole('client'), (req, res) => res.json({ orders: db.prepare('SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC').all(req.user.id) }));

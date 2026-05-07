@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-const dataDir = path.join(process.cwd(), 'server', 'data');
+const dataDir = process.env.DATA_DIR || path.join(process.cwd(), 'server', 'data');
 const dbPath = path.join(dataDir, 'restaurant.sqlite');
 
 fs.mkdirSync(dataDir, { recursive: true });
@@ -150,10 +150,13 @@ export const migrate = () => {
       status TEXT NOT NULL,
       provider TEXT NOT NULL,
       provider_reference TEXT NOT NULL,
+      external_payment_id TEXT,
+      gateway_payload TEXT,
       checkout_url TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS idx_payments_provider_reference ON payments(provider_reference);
 
     CREATE TABLE IF NOT EXISTS refunds (
       id TEXT PRIMARY KEY,
@@ -162,6 +165,7 @@ export const migrate = () => {
       amount REAL NOT NULL,
       reason TEXT NOT NULL,
       status TEXT NOT NULL,
+      provider_refund_id TEXT,
       requested_by TEXT NOT NULL,
       created_at TEXT NOT NULL,
       processed_at TEXT
@@ -207,6 +211,13 @@ export const migrate = () => {
       created_at TEXT NOT NULL
     );
   `);
+
+  const paymentColumns = db.prepare('PRAGMA table_info(payments)').all().map((column) => column.name);
+  if (!paymentColumns.includes('external_payment_id')) db.exec('ALTER TABLE payments ADD COLUMN external_payment_id TEXT');
+  if (!paymentColumns.includes('gateway_payload')) db.exec('ALTER TABLE payments ADD COLUMN gateway_payload TEXT');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_payments_external_payment_id ON payments(external_payment_id)');
+  const refundColumns = db.prepare('PRAGMA table_info(refunds)').all().map((column) => column.name);
+  if (!refundColumns.includes('provider_refund_id')) db.exec('ALTER TABLE refunds ADD COLUMN provider_refund_id TEXT');
 };
 
 const insertOpeningHour = db.transaction((day) => {
@@ -337,6 +348,7 @@ export const mapPayment = (row) => ({
   status: row.status,
   provider: row.provider,
   providerReference: row.provider_reference,
+  externalPaymentId: row.external_payment_id,
   checkoutUrl: row.checkout_url,
   createdAt: row.created_at,
   updatedAt: row.updated_at,

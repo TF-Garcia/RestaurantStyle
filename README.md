@@ -72,7 +72,7 @@ A mesma tela de login atende clientes e administradores. Clientes cadastrados sa
 
 ## Pagamentos e seguranca
 
-O projeto inclui apenas simulacao para desenvolvimento. Em producao, pagamentos reais devem ser processados somente por backend seguro integrado a Stripe, Mercado Pago, Pagar.me, Asaas ou provedor equivalente. A confirmacao real de pagamento deve vir por webhook do gateway. Dados de cartao nunca devem passar pelo frontend do restaurante, nem serem salvos em LocalStorage, banco, estado global ou logs. Estornos reais devem ser feitos via API segura do provedor.
+O projeto inclui apenas simulacao para desenvolvimento. Em producao, pagamentos reais devem ser processados somente por backend seguro integrado a Stripe, Mercado Pago, Pagar.me, Asaas ou provedor equivalente. A confirmacao real de pagamento deve vir por webhook do gateway. Dados de cartao nunca devem passar pelo frontend do restaurante, nem serem salvos em LocalStorage, banco, estado global ou logs. Estornos reais devem ser feitos via API segura do provedor
 
 ## Estrutura
 
